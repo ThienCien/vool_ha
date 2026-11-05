@@ -13,8 +13,11 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    PERCENTAGE,
+    EntityCategory,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
+    UnitOfEnergy,
     UnitOfPower,
 )
 from homeassistant.core import HomeAssistant
@@ -119,6 +122,10 @@ async def async_setup_entry(
         for description in SENSOR_DESCRIPTIONS:
             entities.append(VoolSensor(coordinator, device_type, description))
 
+    # extra charger sensors (connector state, configuration, health)
+    for description in EXTRA_SENSOR_DESCRIPTIONS:
+        entities.append(VoolExtraSensor(coordinator, description))
+
     async_add_entities(entities)
 
 
@@ -189,3 +196,167 @@ class VoolSensor(CoordinatorEntity, SensorEntity):
     def available(self) -> bool:
         """Return True if entity is available."""
         return self.coordinator.last_update_success
+
+# ---------------------------------------------------------------------------
+# Extra charger data (local patch): connector state, configuration, health.
+# value_fn receives the whole coordinator.data dict.
+# ---------------------------------------------------------------------------
+
+def _connector_state(data: dict[str, Any]) -> dict[str, Any] | None:
+    device = data.get("wallbox_device") or {}
+    states = device.get("stateOfConnectors") or []
+    return states[0] if states else None
+
+
+def _cfg(key: str) -> Callable[[dict[str, Any]], Any]:
+    return lambda data: (data.get("wallbox_config") or {}).get(key)
+
+
+def _energy_kwh(data: dict[str, Any]) -> float | None:
+    try:
+        wh = data["wallbox"]["deviceStatus"]["connectors"][0]["energy_imported"]
+    except (KeyError, TypeError, IndexError):
+        return None
+    return round(wh / 1000, 3) if isinstance(wh, (int, float)) else None
+
+
+def _health(key: str) -> Callable[[dict[str, Any]], Any]:
+    return lambda data: (data.get("site_health") or {}).get(key)
+
+
+@dataclass(frozen=True, kw_only=True)
+class VoolExtraSensorEntityDescription(SensorEntityDescription):
+    """Describes an extra VOOL charger sensor."""
+
+    value_fn: Callable[[dict[str, Any]], Any]
+    attrs_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+    source: str = "wallbox_device"
+
+
+EXTRA_SENSOR_DESCRIPTIONS: tuple[VoolExtraSensorEntityDescription, ...] = (
+    VoolExtraSensorEntityDescription(
+        key="connector_status",
+        name="Connector Status",
+        icon="mdi:ev-plug-type2",
+        value_fn=lambda data: (_connector_state(data) or {}).get("computedStatus"),
+        attrs_fn=lambda data: {
+            k: (_connector_state(data) or {}).get(k)
+            for k in ("ocppStatus", "errorCode", "vendorErrorCode", "vendorErrorMessage", "transactionStatus")
+        },
+    ),
+    VoolExtraSensorEntityDescription(
+        key="energy_total",
+        name="Energy Total",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=_energy_kwh,
+        source="wallbox",
+    ),
+    VoolExtraSensorEntityDescription(
+        key="max_charging_current",
+        name="Max Charging Current",
+        device_class=SensorDeviceClass.CURRENT,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        value_fn=_cfg("maximum_charging_current"),
+        source="wallbox_config",
+    ),
+    VoolExtraSensorEntityDescription(
+        key="gsm_signal",
+        name="GSM Signal",
+        icon="mdi:signal",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_cfg("gsm_signal_strength"),
+        source="wallbox_config",
+    ),
+    VoolExtraSensorEntityDescription(
+        key="highest_alarm_code",
+        name="Highest Alarm Code",
+        icon="mdi:alert-circle-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_cfg("highest_alarm_code"),
+        source="wallbox_config",
+    ),
+    VoolExtraSensorEntityDescription(
+        key="health_errors",
+        name="Health Errors",
+        icon="mdi:alert-octagon-outline",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_health("errorCount"),
+        source="site_health",
+    ),
+    VoolExtraSensorEntityDescription(
+        key="health_warnings",
+        name="Health Warnings",
+        icon="mdi:alert-outline",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_health("warningCount"),
+        source="site_health",
+    ),
+)
+
+
+def wallbox_device_info(coordinator: VoolCoordinator) -> DeviceInfo:
+    """Device info shared by the extra charger entities (same device as the base sensors)."""
+    device = (coordinator.data or {}).get("wallbox_device") or {}
+    fw = device.get("firmwareComponentVersions") or {}
+    sw = device.get("firmwareVersion")
+    if sw and fw:
+        sw = f"{sw} (MCU {fw.get('mcu') or '-'}, GW {fw.get('gateway') or '-'}, FP {fw.get('frontPanel') or '-'})"
+    return DeviceInfo(
+        identifiers={(DOMAIN, coordinator.wallbox_api.device_id)},
+        name="VOOL WALLBOX",
+        manufacturer="VOOL",
+        model=device.get("model") or "Charger",
+        serial_number=device.get("serialNumber"),
+        sw_version=sw,
+    )
+
+
+class VoolExtraSensor(CoordinatorEntity, SensorEntity):
+    """Extra VOOL charger sensor."""
+
+    entity_description: VoolExtraSensorEntityDescription
+
+    def __init__(self, coordinator: VoolCoordinator, description: VoolExtraSensorEntityDescription) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._attr_unique_id = f"{coordinator.wallbox_api.device_id}_{description.key}"
+        self._attr_name = f"VOOL WALLBOX {description.name}"
+
+    @property
+    def native_value(self) -> Any:
+        """Return the state."""
+        if not self.coordinator.data:
+            return None
+        try:
+            return self.entity_description.value_fn(self.coordinator.data)
+        except (KeyError, TypeError, IndexError, AttributeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes."""
+        if not self.coordinator.data or not self.entity_description.attrs_fn:
+            return None
+        try:
+            return self.entity_description.attrs_fn(self.coordinator.data)
+        except (KeyError, TypeError, IndexError, AttributeError):
+            return None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return wallbox_device_info(self.coordinator)
+
+    @property
+    def available(self) -> bool:
+        """Available while the coordinator works and this data source has been fetched."""
+        return (
+            self.coordinator.last_update_success
+            and bool(self.coordinator.data)
+            and self.coordinator.data.get(self.entity_description.source) is not None
+        )
